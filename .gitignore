@@ -1,0 +1,8 @@
+# Scraper output (media files and manifests)
+media_output/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
