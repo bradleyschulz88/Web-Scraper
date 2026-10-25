@@ -1,20 +1,37 @@
 # Web Scraper — Image & Video Collector
 
 A local Python tool that opens a URL in Chromium, loads the whole page (scrolling,
-"load more" buttons, lazy images), collects every image/video/audio URL it can see,
+"load more" buttons, lazy images and videos), collects every image/video/audio URL it can see,
 and downloads the files. It writes JSON and CSV manifests so you can review what was
 found and what failed.
 
 ## Quick start (Windows)
 
-1. Double-click **`run.bat`** in this folder.
-2. The first run installs everything it needs (a few minutes, once only).
-3. Paste the page URL when prompted and press Enter.
-4. A browser window opens — sign in if the site needs it, then go back to the
-   console window and press Enter to start scanning.
-5. Your files appear in `media_output\` (images, videos, audio, and the manifests).
+Use PowerShell (no `.bat` file needed):
 
-Prefer the command line? See [Run](#run) below.
+1. Open **Windows PowerShell**.
+2. Go to the scraper folder:
+   ```powershell
+   cd "$env:USERPROFILE\Web-Scraper"
+   ```
+3. First time only, install the browser and required packages:
+   ```powershell
+   py -3 -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+   .\.venv\Scripts\python.exe -m playwright install chromium
+   ```
+4. Start the scraper:
+   ```powershell
+   .\.venv\Scripts\python.exe .\media_url_scraper.py
+   ```
+5. Paste the page URL. Sign in in the browser if needed, then return to PowerShell
+   and press Enter to start scanning.
+6. While it scans, press **Enter** in PowerShell or click **Stop & Save All** in
+   the small bar at the bottom-right of the browser whenever you are ready. It
+   stops looking for more items, saves everything found, and writes the manifests.
+   One **Ctrl+C** also asks it to finish saving.
+7. Your files appear in `media_output\` (images, videos, audio, and the manifests).
+
 
 ## How it finds media
 
@@ -24,16 +41,19 @@ so this tool collects from three independent layers and merges the results:
 1. **Network capture** — the browser reports every image/video/audio request it makes,
    including files loaded by JavaScript, files inside iframes, files already removed
    from a virtualised feed, and streams that never appear in the HTML. For images
-   (and small videos) the exact bytes the browser received are saved, which also
-   side-steps hot-link protection and short-lived signed URLs.
+   and videos up to the capture-size limit, the exact bytes the browser received
+   are saved, which also side-steps hot-link protection and short-lived signed URLs.
+   Larger videos can still be downloaded in the save-all stage. Video-specific lazy
+   attributes and extensionless video URLs are also treated as videos.
 2. **DOM scan** — `img`/`video`/`audio`/`source` elements, `srcset` candidates,
    lazy-load attributes (`data-src`, `data-lazy-src`, `data-bg`, …), media links,
    `og:image`/`twitter:image` metadata, `<noscript>` fallbacks, `<template>` blocks,
    elements inside **shadow DOM**, **iframe** content, and background images from
    CSS (including `::before`/`::after` generated content and inline styles).
 3. **Rendering pass** — scrolls down *and* back up, scrolls inner scroll containers
-   (SPA galleries), clicks "load more"/"show more" buttons, and forces lazy images
-   to load until the page stops producing new media.
+   (SPA galleries), clicks "load more"/"show more" buttons, and forces lazy media
+   to load until the page stops producing new media. A floating browser control
+   shows the current image/video counts and can stop scanning cleanly at any time.
 
 Extra handling:
 
@@ -109,7 +129,8 @@ media_output/
 | `--browser-path PATH` | Use a specific Chrome/Chromium binary. |
 | `--pause SECONDS` | Delay after each scroll step (default 1.2). |
 | `--scroll-step PX` | Pixels per scroll step (default 1000). |
-| `--max-scroll-rounds N` | Safety cap on full page passes (default 120). |
+| `--max-scroll-rounds N` | Safety cap on full page passes (default 300). |
+| `--max-load-more N` | Maximum number of "load more" clicks (default 250). |
 | `--stable-rounds N` | Stop after N passes with nothing new (default 3). |
 | `--no-download` | Collect URLs only; do not save files. |
 | `--no-network-capture` | Disable network-level capture. |
