@@ -36,6 +36,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,7 +56,7 @@ OUTPUT_DIR = Path(os.environ.get("SCRAPER_OUTPUT", "media_output"))
 SCROLL_STEP_PX = 1000
 PAUSE_AFTER_SCROLL_SECONDS = 1.2   # Delay after each scroll step
 MAX_STABLE_ROUNDS = 3              # Stop after N full passes with nothing new
-MAX_SCROLL_ROUNDS = 120            # Safety cap for long/infinite feeds
+MAX_SCROLL_ROUNDS = 300            # Safety cap for long/infinite feeds
 NAVIGATION_TIMEOUT_MS = 60000
 
 DOWNLOAD_FILES = True
@@ -67,12 +68,12 @@ CAPTURE_NETWORK_MEDIA = True       # Save media the browser itself loads (recomm
 RECOVER_BLOB_MEDIA = True          # Recover images/videos living in blob: URLs
 SCAN_IFRAMES = True                # Scan media inside iframes
 CLICK_LOAD_MORE = True             # Click "load more"/"show more" buttons
-MAX_LOAD_MORE_CLICKS = 40
+MAX_LOAD_MORE_CLICKS = 250
 
 # Size caps (bytes) for in-flight capture and blob recovery
 MAX_IMAGE_CAPTURE_BYTES = 64 * 1024 * 1024
-MAX_VIDEO_CAPTURE_BYTES = 64 * 1024 * 1024
-MAX_TOTAL_CAPTURE_BYTES = 4 * 1024 * 1024 * 1024
+MAX_VIDEO_CAPTURE_BYTES = 512 * 1024 * 1024
+MAX_TOTAL_CAPTURE_BYTES = 32 * 1024 * 1024 * 1024
 MAX_BLOB_RECOVERY_BYTES = 16 * 1024 * 1024
 
 # Streams
@@ -262,11 +263,11 @@ COLLECT_MEDIA_JS = r"""
     });
   };
 
-  const pushCssUrls = (value, el, note) => {
+  const pushCssUrls = (value, el, note, forcedKind) => {
     if (!value || typeof value !== 'string' || value === 'none') return;
     CSS_URL_RE.lastIndex = 0;
     let m;
-    while ((m = CSS_URL_RE.exec(value)) !== null) push(m[2], null, el, note);
+    while ((m = CSS_URL_RE.exec(value)) !== null) push(m[2], forcedKind || null, el, note);
   };
 
   const LAZY_ATTRS = [
@@ -279,15 +280,15 @@ COLLECT_MEDIA_JS = r"""
   ];
   const SRCSET_ATTRS = ['data-srcset', 'data-lazy-srcset', 'data-original-set'];
 
-  const pushLazyAttr = (el, name) => {
+  const pushLazyAttr = (el, name, forcedKind) => {
     const raw = el.getAttribute(name);
     if (!raw) return;
     const val = String(raw).trim().replace(/^['"]|['"]$/g, '');
     if (!val || val === '#' || /^data:/i.test(val)) return;
-    if (/srcset|(?:^|-)set$/.test(name) || /\s+\d+[wx]\s*(,|$)/.test(val)) { pushSrcset(val, null, el, name); return; }
-    if (/url\(/i.test(val)) { pushCssUrls(val, el, name); return; }
-    if (/\s/.test(val)) { val.split(/\s+/).forEach(part => { if (part && !/^(https?|\/|\.\.?\/)/.test(part)) return; push(part, null, el, name); }); return; }
-    push(val, null, el, name);
+    if (/srcset|(?:^|-)set$/.test(name) || /\s+\d+[wx]\s*(,|$)/.test(val)) { pushSrcset(val, forcedKind || null, el, name); return; }
+    if (/url\(/i.test(val)) { pushCssUrls(val, el, name, forcedKind); return; }
+    if (/\s/.test(val)) { val.split(/\s+/).forEach(part => { if (part && !/^(https?|\/|\.\.?\/)/.test(part)) return; push(part, forcedKind || null, el, name); }); return; }
+    push(val, forcedKind || null, el, name);
   };
 
   const MEDIA_LINK_RE = /\.(?:jpe?g|png|gif|webp|avif|svg|bmp|tiff?|ico|mp4|m4v|webm|mov|mkv|m3u8|mpd|mp3|m4a|aac|ogg|opus|wav|flac)(?:$|[?#])/i;
@@ -310,7 +311,7 @@ COLLECT_MEDIA_JS = r"""
       push(el.getAttribute('src'), kind, el, 'source element');
       push(el.getAttribute('srcset'), 'image', el, 'source srcset');
       pushSrcset(el.getAttribute('srcset'), 'image', el, 'source srcset');
-      LAZY_ATTRS.forEach(a => { if (el.hasAttribute(a)) pushLazyAttr(el, a); });
+      LAZY_ATTRS.forEach(a => { if (el.hasAttribute(a)) pushLazyAttr(el, a, kind); });
       return;
     }
 
@@ -319,7 +320,8 @@ COLLECT_MEDIA_JS = r"""
       push(el.currentSrc, kind, el, tag + ' currentSrc');
       push(el.getAttribute('src'), kind, el, tag + ' src');
       push(el.getAttribute('poster'), 'image', el, tag + ' poster');
-      LAZY_ATTRS.concat(['data-poster']).forEach(a => { if (el.hasAttribute(a)) pushLazyAttr(el, a); });
+      LAZY_ATTRS.forEach(a => { if (el.hasAttribute(a)) pushLazyAttr(el, a, kind); });
+      if (el.hasAttribute('data-poster')) pushLazyAttr(el, 'data-poster', 'image');
       return;
     }
 
@@ -493,9 +495,11 @@ FORCE_LOAD_JS = r"""
     if (!cur || /^blob:/i.test(cur)) {
       for (const a of ['data-src', 'data-video-src', 'data-video', 'data-file', 'data-mp4', 'data-hls', 'data-url', 'data-video-url']) {
         const val = v.getAttribute(a);
-        if (val && /\.(mp4|webm|m3u8|mpd|mov|m4v)/i.test(val)) { try { v.src = val; changed++; break; } catch (e) {} }
+        // Video-specific attributes can contain signed or extensionless URLs.
+        if (val && !/^data:/i.test(val)) { try { v.src = val; changed++; break; } catch (e) {} }
       }
     }
+    try { if (v.currentSrc || v.getAttribute('src')) v.load(); } catch (e) {}
   });
   document.querySelectorAll('source').forEach(s => {
     const a = s.getAttribute('data-src');
@@ -525,6 +529,7 @@ CLICK_LOAD_MORE_JS = r"""
     try { txt = (el.textContent || '').trim().toLowerCase(); } catch (e) { continue; }
     if (!txt || txt.length > 40) continue;
     if (!words.some(w => txt.indexOf(w) !== -1)) continue;
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
     let r = { width: 0, height: 0 };
     try { r = el.getBoundingClientRect(); } catch (e) {}
     if (r.width <= 0 || r.height <= 0) continue;
@@ -636,6 +641,54 @@ async (maxBytes) => {
 }
 """
 
+# Floating in-page control: the count is refreshed as each gallery pass ends,
+# and its button requests a clean stop rather than closing the browser.
+INSTALL_STOP_UI_JS = r"""
+() => {
+  if (!document.body) return false;
+  let host = document.getElementById('__media_scraper_stop_host');
+  if (host) return true;
+  host = document.createElement('div');
+  host.id = '__media_scraper_stop_host';
+  host.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647';
+  const root = host.attachShadow ? host.attachShadow({mode:'open'}) : host;
+  root.innerHTML = `<style>
+    .bar{font:14px/1.35 system-ui,-apple-system,Segoe UI,sans-serif;background:#17202b;color:#fff;
+      border:1px solid #526273;border-radius:12px;padding:12px 14px;box-shadow:0 6px 24px #0006;
+      display:flex;align-items:center;gap:12px;max-width:min(90vw,520px)}
+    .count{white-space:nowrap}.stop{font:inherit;font-weight:700;color:#fff;background:#d83c68;border:0;
+      border-radius:999px;padding:9px 14px;cursor:pointer;white-space:nowrap}.stop:hover{background:#b92e55}
+    .stop:disabled{background:#59636e;cursor:default}.hint{font-size:11px;color:#d2d8df;margin-top:3px}
+  </style><div class="bar"><div><div class="count">Found: 0 images · 0 videos</div>
+    <div class="hint">Scanning…</div></div><button class="stop" type="button">Stop &amp; Save All</button></div>`;
+  const button = root.querySelector('button');
+  button.addEventListener('click', () => {
+    button.disabled = true;
+    button.textContent = 'Stopping…';
+    const hint = root.querySelector('.hint');
+    if (hint) hint.textContent = 'Saving everything found so far…';
+    if (window.__mediaScraperStopAndSave) window.__mediaScraperStopAndSave();
+  });
+  document.body.appendChild(host);
+  return true;
+}
+"""
+
+UPDATE_STOP_UI_JS = r"""
+({images, videos, audio, stopping}) => {
+  let host = document.getElementById('__media_scraper_stop_host');
+  if (!host) return false;
+  const root = host.shadowRoot || host;
+  const count = root.querySelector('.count');
+  const hint = root.querySelector('.hint');
+  const button = root.querySelector('button');
+  if (count) count.textContent = `Found: ${images.toLocaleString()} images · ${videos.toLocaleString()} videos`;
+  if (hint) hint.textContent = stopping ? 'Saving everything found so far…' : `Scanning…${audio ? ` · ${audio.toLocaleString()} audio` : ''}`;
+  if (stopping && button) { button.disabled = true; button.textContent = 'Stopping…'; }
+  return true;
+}
+"""
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -668,20 +721,23 @@ def looks_like_media_url(url: str) -> bool:
     return bool(MEDIA_EXT_RE.search(url or ""))
 
 
-def kind_from_content_type(content_type: str, url: str = "") -> str | None:
+def kind_from_content_type(content_type: str, url: str = "", resource_type: str = "") -> str | None:
     ctype = (content_type or "").split(";")[0].strip().lower()
     if not ctype:
         return None
     if ctype.startswith("image/"):
         return "image"
-    if ctype.startswith("video/"):
+    if ctype.startswith("video/") or ctype in ("application/mp4", "application/vnd.ms-sstr+xml"):
         return "video"
     if ctype.startswith("audio/"):
         return "audio"
     if ctype in HLS_CONTENT_TYPES or ctype in DASH_CONTENT_TYPES:
         return "video"
-    if ctype in ("application/octet-stream", "binary/octet-stream") and looks_like_media_url(url):
-        return kind_from_url(url)
+    if ctype in ("application/octet-stream", "binary/octet-stream"):
+        if looks_like_media_url(url):
+            return kind_from_url(url)
+        if resource_type == "media":
+            return "video"
     return None
 
 
@@ -977,7 +1033,14 @@ def _attach_network_listeners(page, state: MediaState, cfg: Config) -> None:
             except Exception:
                 pass
             content_type = headers.get("content-type", "")
-            kind = kind_from_content_type(content_type, url)
+            resource_type = ""
+            try:
+                resource_type = response.request.resource_type
+            except Exception:
+                pass
+            kind = kind_from_content_type(content_type, url, resource_type)
+            if kind is None and resource_type == "media":
+                kind = "video"
             if kind is None and looks_like_media_url(url) and not url.lower().startswith("data:"):
                 kind = kind_from_url(url)
             if kind is None:
@@ -1042,10 +1105,13 @@ def _attach_network_listeners(page, state: MediaState, cfg: Config) -> None:
     page.on("response", on_response)
 
 
-async def _wait_for_media_idle(state: MediaState, timeout_s: float = 10.0) -> None:
-    """Let in-flight image/video requests finish (bounded wait)."""
+async def _wait_for_media_idle(state: MediaState, timeout_s: float = 10.0,
+                               stop_event: asyncio.Event | None = None) -> None:
+    """Let in-flight image/video requests finish (bounded, stop-aware wait)."""
     deadline = asyncio.get_running_loop().time() + timeout_s
     while state.pending > 0 and asyncio.get_running_loop().time() < deadline:
+        if stop_event and stop_event.is_set():
+            break
         await asyncio.sleep(0.25)
 
 
@@ -1091,7 +1157,8 @@ async def _force_load_media(page, state: MediaState, cfg: Config) -> int:
     return changed
 
 
-async def _click_load_more(page, state: MediaState, cfg: Config) -> str | None:
+async def _click_load_more(page, state: MediaState, cfg: Config,
+                          stop_event: asyncio.Event | None = None) -> str | None:
     if not cfg.click_load_more:
         return None
     try:
@@ -1099,7 +1166,7 @@ async def _click_load_more(page, state: MediaState, cfg: Config) -> str | None:
     except Exception:
         return None
     if clicked:
-        await asyncio.sleep(max(0.8, cfg.pause_after_scroll))
+        await _pause_or_stop(stop_event, max(0.8, cfg.pause_after_scroll))
     return clicked
 
 
@@ -1162,20 +1229,69 @@ async def _recover_blobs(page, state: MediaState, cfg: Config) -> int:
     return recovered
 
 
-async def _scroll_pass(page, state: MediaState, cfg: Config, direction: str) -> int:
+async def _pause_or_stop(stop_event: asyncio.Event | None, seconds: float) -> bool:
+    """Wait for a short delay, returning early if the user requested a stop."""
+    if stop_event is None:
+        await asyncio.sleep(seconds)
+        return False
+    if stop_event.is_set():
+        return True
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=max(0.0, seconds))
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _update_stop_ui(page, state: MediaState, stopping: bool = False) -> None:
+    counts = {kind: 0 for kind in ("image", "video", "audio")}
+    for record in state.items.values():
+        if record.get("kind") in counts:
+            counts[record["kind"]] += 1
+    try:
+        await page.evaluate(INSTALL_STOP_UI_JS)
+        await page.evaluate(UPDATE_STOP_UI_JS, {
+            "images": counts["image"], "videos": counts["video"],
+            "audio": counts["audio"], "stopping": stopping,
+        })
+    except Exception:
+        # The page may have navigated or closed its document during collection.
+        pass
+
+
+async def _finalize_collection(page, state: MediaState, cfg: Config) -> None:
+    """Finish pending captures and recover any page-created blobs before saving."""
+    await _wait_for_media_idle(state, 10.0)
+    recovered = await _recover_blobs(page, state, cfg)
+    if recovered:
+        log(f"Recovered {recovered} blob: media item(s) from the browser")
+    if state.capture_tasks:
+        await asyncio.gather(*list(state.capture_tasks), return_exceptions=True)
+
+
+async def _scroll_pass(page, state: MediaState, cfg: Config, direction: str,
+                       stop_event: asyncio.Event | None = None) -> int:
     """Scroll one full pass down (or back up), collecting at every step."""
+    if stop_event and stop_event.is_set():
+        return 0
     await page.evaluate(SCROLL_TO_JS, "top" if direction == "down" else "bottom")
-    await asyncio.sleep(0.4)
+    if await _pause_or_stop(stop_event, 0.4):
+        return 0
     step = abs(cfg.scroll_step_px) if direction == "down" else -abs(cfg.scroll_step_px)
     moved_total = 0
     stalled_steps = 0
     previous_height = None
     for _step_no in range(1, 5001):  # safety cap for endless feeds
+        if stop_event and stop_event.is_set():
+            break
         moved = await page.evaluate(SCROLL_BY_JS, step)
         moved = abs(moved or 0)
         moved_total += moved
-        await asyncio.sleep(cfg.pause_after_scroll)
-        await _collect_page(page, state, cfg, deep=False)
+        if await _pause_or_stop(stop_event, cfg.pause_after_scroll):
+            break
+        added = await _collect_page(page, state, cfg, deep=False)
+        if added:
+            await _update_stop_ui(page, state)
         height = await page.evaluate(PAGE_HEIGHT_JS)
         height_stable = previous_height is not None and abs(height - previous_height) < 2
         if moved < 2 and height_stable:
@@ -1188,58 +1304,83 @@ async def _scroll_pass(page, state: MediaState, cfg: Config, direction: str) -> 
     return moved_total
 
 
-async def collect_all(page, state: MediaState, cfg: Config) -> None:
-    """Walk the page (down, up, load-more, deep sweeps) until nothing is new."""
+async def collect_all(page, state: MediaState, cfg: Config,
+                      stop_event: asyncio.Event | None = None) -> None:
+    """Collect until idle, capped, or the user requests Stop & Save All."""
     try:
-        scrollers = await page.evaluate(FIND_SCROLLERS_JS)
-        if scrollers:
-            log(f"Inner scroll containers found: {', '.join(scrollers[:4])}")
-    except Exception:
-        pass
+        try:
+            scrollers = await page.evaluate(FIND_SCROLLERS_JS)
+            if scrollers:
+                log(f"Inner scroll containers found: {', '.join(scrollers[:4])}")
+        except Exception:
+            pass
 
-    await _collect_page(page, state, cfg, deep=True)
-    log(f"Initial scan: {len(state.items)} media URLs")
+        await _collect_page(page, state, cfg, deep=True)
+        log(f"Initial scan: {len(state.items)} media URLs")
+        await _update_stop_ui(page, state)
 
-    longest_idle_round = 0
-    previous_metrics = None
-    for round_no in range(1, cfg.max_scroll_rounds + 1):
-        before = len(state.items)
-        await _scroll_pass(page, state, cfg, "down")
-        clicked = await _click_load_more(page, state, cfg)
-        if clicked and round_no <= cfg.max_load_more_clicks:
-            await _wait_for_media_idle(state, 6.0)
-            await _collect_page(page, state, cfg, deep=False)
-        await _scroll_pass(page, state, cfg, "up")
+        longest_idle_round = 0
+        previous_metrics = None
+        load_more_clicks = 0
+        for round_no in range(1, cfg.max_scroll_rounds + 1):
+            if stop_event and stop_event.is_set():
+                break
+            before = len(state.items)
+            await _scroll_pass(page, state, cfg, "down", stop_event)
+            if stop_event and stop_event.is_set():
+                break
 
-        forced = await _force_load_media(page, state, cfg)
-        if forced:
-            await _wait_for_media_idle(state, 8.0)
-        await _wait_for_media_idle(state, 6.0)
-        added = await _collect_page(page, state, cfg, deep=True)
+            clicked = None
+            if load_more_clicks < cfg.max_load_more_clicks:
+                clicked = await _click_load_more(page, state, cfg, stop_event)
+            if clicked:
+                load_more_clicks += 1
+                await _wait_for_media_idle(state, 6.0, stop_event)
+                await _collect_page(page, state, cfg, deep=False)
 
-        height = await page.evaluate(PAGE_HEIGHT_JS)
-        metrics = (height, len(state.items), state.capture_bytes)
-        new_items = len(state.items) - before
-        progress(
-            f"Round {round_no}/{cfg.max_scroll_rounds} | media: {len(state.items)} "
-            f"(+{new_items}) | captured: {len(state.captured_urls)} | height: {height}px"
-        )
-        if metrics == previous_metrics and added == 0 and new_items == 0:
-            longest_idle_round += 1
-        else:
-            longest_idle_round = 0
-        if longest_idle_round >= cfg.max_stable_rounds:
-            break
-        previous_metrics = metrics
+            if stop_event and stop_event.is_set():
+                break
+            await _scroll_pass(page, state, cfg, "up", stop_event)
+            if stop_event and stop_event.is_set():
+                break
 
-    await _wait_for_media_idle(state, 10.0)
-    recovered = await _recover_blobs(page, state, cfg)
-    if recovered:
-        log(f"Recovered {recovered} blob: media item(s) from the browser")
-    if state.capture_tasks:
-        await asyncio.gather(*list(state.capture_tasks), return_exceptions=True)
-    if _IS_TTY:
-        print()
+            forced = await _force_load_media(page, state, cfg)
+            if forced:
+                await _wait_for_media_idle(state, 8.0, stop_event)
+            await _wait_for_media_idle(state, 6.0, stop_event)
+            added = await _collect_page(page, state, cfg, deep=True)
+
+            height = await page.evaluate(PAGE_HEIGHT_JS)
+            metrics = (height, len(state.items), state.capture_bytes)
+            new_items = len(state.items) - before
+            progress(
+                f"Round {round_no}/{cfg.max_scroll_rounds} | media: {len(state.items)} "
+                f"(+{new_items}) | captured: {len(state.captured_urls)} | "
+                f"Load more: {load_more_clicks}/{cfg.max_load_more_clicks} | height: {height}px"
+            )
+            await _update_stop_ui(page, state)
+            if metrics == previous_metrics and added == 0 and new_items == 0:
+                longest_idle_round += 1
+            else:
+                longest_idle_round = 0
+            if longest_idle_round >= cfg.max_stable_rounds:
+                break
+            previous_metrics = metrics
+    except asyncio.CancelledError:
+        # asyncio.run turns a single Ctrl+C into task cancellation. Consume that
+        # request so we can still recover blobs, download the collected media,
+        # and write the manifests. A second Ctrl+C can still force-quit.
+        if stop_event:
+            stop_event.set()
+        log("\nStop requested. Finishing the save-all steps…")
+        task = asyncio.current_task()
+        if task is not None and hasattr(task, "uncancel"):
+            task.uncancel()
+    finally:
+        await _update_stop_ui(page, state, stopping=bool(stop_event and stop_event.is_set()))
+        await _finalize_collection(page, state, cfg)
+        if _IS_TTY:
+            print()
 
 
 # --------------------------------------------------------------------------- #
@@ -1700,6 +1841,8 @@ def build_config(args: argparse.Namespace) -> Config:
         cfg.pause_after_scroll = args.pause
     if args.max_scroll_rounds:
         cfg.max_scroll_rounds = args.max_scroll_rounds
+    if getattr(args, "max_load_more", None) is not None:
+        cfg.max_load_more_clicks = args.max_load_more
     if args.stable_rounds:
         cfg.max_stable_rounds = args.stable_rounds
     if args.no_download:
@@ -1717,6 +1860,24 @@ def build_config(args: argparse.Namespace) -> Config:
     if args.no_login_wait:
         cfg.wait_for_login = False
     return cfg
+
+
+def _start_console_stop_listener(loop: asyncio.AbstractEventLoop,
+                                 stop_event: asyncio.Event) -> None:
+    """Let Enter in the console request a clean Stop & Save All."""
+    if not sys.stdin.isatty():
+        return
+
+    def wait_for_enter() -> None:
+        try:
+            sys.stdin.readline()
+            loop.call_soon_threadsafe(stop_event.set)
+        except (EOFError, OSError, RuntimeError, ValueError):
+            pass
+
+    log("Press Enter here at any time to stop scanning and save everything found.")
+    listener = threading.Thread(target=wait_for_enter, name="scraper-stop-key", daemon=True)
+    listener.start()
 
 
 async def run(url: str, cfg: Config) -> dict:
@@ -1760,13 +1921,22 @@ async def run(url: str, cfg: Config) -> dict:
 
         final_url = page.url
         user_agent = await page.evaluate("navigator.userAgent")
-        log("Scanning: scrolling down and back up, clicking load-more buttons, capturing media...")
+        stop_event = asyncio.Event()
+
+        def request_stop(_source=None):
+            if not stop_event.is_set():
+                stop_event.set()
+                log("\nStop requested. Saving everything found so far…")
 
         try:
-            await collect_all(page, state, cfg)
-        finally:
-            if state.capture_tasks:
-                await asyncio.gather(*list(state.capture_tasks), return_exceptions=True)
+            await page.expose_binding("__mediaScraperStopAndSave", request_stop)
+            await page.evaluate(INSTALL_STOP_UI_JS)
+        except Exception:
+            pass
+        _start_console_stop_listener(asyncio.get_running_loop(), stop_event)
+        log("Scanning: scrolling, loading more items, capturing images and videos...")
+
+        await collect_all(page, state, cfg, stop_event)
 
         log(f"\nCollection finished: {len(state.items)} unique media URL(s) "
             f"({len(state.captured_urls)} file(s) captured in flight)")
@@ -1799,7 +1969,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--browser-path", help="Path to a Chrome/Chromium binary to use")
     parser.add_argument("--scroll-step", type=int, help="Pixels per scroll step")
     parser.add_argument("--pause", type=float, help="Seconds to wait after each scroll step")
-    parser.add_argument("--max-scroll-rounds", type=int, help="Safety cap on full page passes")
+    parser.add_argument("--max-scroll-rounds", type=int, help="Safety cap on full page passes (default: 300)")
+    parser.add_argument("--max-load-more", type=int, help="Maximum number of load-more button clicks (default: 250)")
     parser.add_argument("--stable-rounds", type=int, help="Stop after N passes with no new media")
     parser.add_argument("--no-download", action="store_true", help="Collect URLs only")
     parser.add_argument("--no-blobs", action="store_true", help="Do not recover blob: media")
@@ -1825,7 +1996,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         asyncio.run(run(url, cfg))
     except KeyboardInterrupt:
-        log("\nInterrupted. Re-run when ready; partial results were written if the scan had finished a round.")
+        log("\nInterrupted during saving. Files already saved remain in the output folder; the manifests may be incomplete.")
 
 
 if __name__ == "__main__":
